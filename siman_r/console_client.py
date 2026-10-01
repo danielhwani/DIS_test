@@ -2,7 +2,10 @@
 
 - 응답을 기대하는 요청마다 Request ID를 부여한다. 카운터 시작값은 부팅 시각 기반 (5.3절).
 - 응답 대기 시간 초과 시 같은 Request ID로 재전송한다 (10.9절 예시 1).
-- 같은 Request ID의 첫 응답(Pending 포함)을 받으면 재전송을 멈추고 최종 상태까지 기다린다.
+- 같은 Request ID의 첫 응답(Pending 포함)을 받으면 빠른 재전송을 멈추고 최종 상태까지 기다린다.
+  기다리는 동안 status_poll_interval_s마다 같은 Request ID로 다시 보내 최신 상태를 묻는다.
+  차량은 이를 중복 요청으로 보고 재실행 없이 최신 응답만 돌려주므로, Executing·Complete 응답이
+  손실되어도 다음 재질의에서 복구된다.
 - 자기 앞(Receiving ID)이 아니거나 이미 포기한 Request ID의 응답은 무시한다.
 
 실행: python -m siman_r.console_client --vehicle 127.0.0.1:3000
@@ -26,6 +29,7 @@ class ReliabilityParams:
     """연습 수준 운영 파라미터 (PDU 필드가 아님, 4.1절). 값은 실측 후 확정."""
     response_timeout_s: float = 1.0
     max_retries: int = 3
+    status_poll_interval_s: float = 3.0
     completion_timeout_s: float = 30.0
 
 
@@ -34,6 +38,7 @@ class RequestResult:
     request_id: int
     responses: list[ActionResponseR] = field(default_factory=list)
     attempts: int = 0
+    polls: int = 0
     timed_out: bool = False
 
     @property
@@ -117,14 +122,28 @@ class ConsoleClient(asyncio.DatagramProtocol):
                 log.error("  req=%d 재시도 %d회 소진, 포기", rid, self.params.max_retries)
                 return res
             if wait_final:
-                try:
-                    await asyncio.wait_for(p.done.wait(), self.params.completion_timeout_s)
-                except asyncio.TimeoutError:
-                    res.timed_out = True
-                    log.error("  req=%d 완료 대기 시간 초과", rid)
+                await self._wait_final(p, data, rid)
             return res
         finally:
             del self._pending[rid]                  # 이후 도착한 옛 응답은 무시
+
+
+    async def _wait_final(self, p: _Pending, data: bytes, rid: int) -> None:
+        deadline = time.monotonic() + self.params.completion_timeout_s
+        while not p.done.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                p.result.timed_out = True
+                log.error("  req=%d 완료 대기 시간 초과", rid)
+                return
+            try:
+                await asyncio.wait_for(p.done.wait(),
+                                       min(self.params.status_poll_interval_s, remaining))
+            except asyncio.TimeoutError:
+                if time.monotonic() < deadline:
+                    p.result.polls += 1
+                    log.info("→ req=%d 상태 재질의 (%d회)", rid, p.result.polls)
+                    self._send(data)
 
 
 async def open_client(client: ConsoleClient, local=("0.0.0.0", 0)):

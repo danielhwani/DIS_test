@@ -5,6 +5,7 @@ import unittest
 from siman_r import envelope as env
 from siman_r.envelope import ActionRequestR, ActionResponseR, EntityId, Payload
 from siman_r.console_client import ConsoleClient, ReliabilityParams, open_client
+from siman_r import vehicle_server
 from siman_r.vehicle_server import VehicleServer, serve
 
 VEH = EntityId(1, 3, 1)
@@ -57,7 +58,8 @@ class EnvelopeLayout(unittest.TestCase):
 
 
 class Handshake(unittest.IsolatedAsyncioTestCase):
-    FAST = ReliabilityParams(response_timeout_s=0.2, max_retries=3, completion_timeout_s=3.0)
+    FAST = ReliabilityParams(response_timeout_s=0.2, max_retries=3,
+                             status_poll_interval_s=0.3, completion_timeout_s=3.0)
 
     async def asyncSetUp(self):
         self.srv = VehicleServer(VEH, exercise_id=1, op_durations=(0.2, 0.3))
@@ -107,6 +109,40 @@ class Handshake(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([x.request_status for x in r.responses],
                          [env.STATUS_PENDING, env.STATUS_EXECUTING, env.STATUS_COMPLETE])
         self.assertTrue(all(x.request_id == r.request_id for x in r.responses))
+
+    async def test_lost_progress_responses_recovered_by_poll(self):
+        """Executing·Complete 응답이 손실돼도 같은 Request ID 재질의로 최종 상태를 받는다."""
+        lost = set()
+
+        def drop_once(resp):
+            s = resp.request_status
+            if s in (env.STATUS_EXECUTING, env.STATUS_COMPLETE) and s not in lost:
+                lost.add(s)
+                return True
+            return False
+        c = await self.client()
+        await self.connect(c)
+        self.srv.drop_if = drop_once
+        r = await c.request(VEH, "Command_AutonomousOperation",
+                            {"operation": "START", "task_id": "T-001"})
+        self.assertFalse(r.timed_out)
+        self.assertEqual(r.final.request_status, env.STATUS_COMPLETE)
+        self.assertGreaterEqual(r.polls, 1)
+        self.assertEqual(lost, {env.STATUS_EXECUTING, env.STATUS_COMPLETE})
+        self.assertEqual(self.srv.executions, 2)            # 접속 1 + 명령 1, 재질의로 재실행 없음
+
+    async def test_poll_does_not_reexecute_after_dedup_ttl(self):
+        """명령이 중복 기록 유지 시간(TTL)보다 오래 걸려도 진행 중 항목은 만료되지 않는다."""
+        old = vehicle_server.DEDUP_TTL_S
+        vehicle_server.DEDUP_TTL_S = 0.1
+        self.addCleanup(setattr, vehicle_server, "DEDUP_TTL_S", old)
+        self.srv.op_durations = (0.2, 1.0)
+        c = await self.client()
+        await self.connect(c)
+        r = await c.request(VEH, "Command_AutonomousOperation", {"operation": "START"})
+        self.assertEqual(r.final.request_status, env.STATUS_COMPLETE)
+        self.assertGreaterEqual(r.polls, 2)
+        self.assertEqual(self.srv.executions, 2)
 
     async def test_command_without_control_denied(self):
         c = await self.client()

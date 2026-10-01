@@ -3,6 +3,7 @@
 - 고정 포트에 bind하여 대기하고, 수신 패킷의 발신 주소로 응답한다 (3.3절).
 - 승인된 Exercise ID와 자기 앞(Receiving ID)으로 온 PDU만 처리한다 (8장 안전 격리).
 - (Originating ID, Request ID)로 중복을 판단하여 재적용 없이 마지막 응답만 재송신한다 (10.9절 예시 1).
+  콘솔이 진행 중 명령의 상태를 같은 Request ID로 다시 물을 때도 이 경로로 최신 상태를 돌려준다.
 - 오래 걸리는 명령은 같은 Request ID로 Pending → Executing → Complete를 보낸다 (10.9절 예시 2).
 
 실행: python -m siman_r.vehicle_server --port 3000
@@ -15,6 +16,7 @@ import logging
 import random
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 from . import envelope as env
 from .envelope import ActionRequestR, ActionResponseR, EntityId, Payload
@@ -28,18 +30,21 @@ DEDUP_TTL_S = 60.0
 class _Handled:
     last_response: bytes | None
     addr: tuple
-    t: float
+    t: float                  # 마지막 응답 시각
+    final: bool = False       # 최종 상태(완료·거부)를 보냈는지. 진행 중인 항목은 만료하지 않는다
 
 
 class VehicleServer(asyncio.DatagramProtocol):
     def __init__(self, entity_id: EntityId, exercise_id: int,
                  op_durations: tuple[float, float] = (2.5, 5.0),
-                 drop_tx: float = 0.0, drop_first_n_tx: int = 0):
+                 drop_tx: float = 0.0, drop_first_n_tx: int = 0,
+                 drop_if: Callable[[ActionResponseR], bool] | None = None):
         self.me = entity_id
         self.exercise_id = exercise_id
         self.op_durations = op_durations          # (계획 완료까지, 임무 완료까지) s
         self.drop_tx = drop_tx                    # 무선 손실 모의 (확률)
         self.drop_first_n_tx = drop_first_n_tx    # 무선 손실 모의 (처음 n개 송신 손실)
+        self.drop_if = drop_if                    # 무선 손실 모의 (조건에 맞는 응답 손실, 시험용)
         self.transport: asyncio.DatagramTransport | None = None
         self.handled: dict[tuple[EntityId, int], _Handled] = {}
         self.controller: EntityId | None = None   # 제어권 보유 콘솔
@@ -52,6 +57,9 @@ class VehicleServer(asyncio.DatagramProtocol):
         self.transport = transport
 
     def _send(self, data: bytes, addr) -> None:
+        if self.drop_if is not None and self.drop_if(env.decode(data)):
+            log.warning("  [loss] 응답 %d B 손실 모의", len(data))
+            return
         if self.drop_first_n_tx > 0:
             self.drop_first_n_tx -= 1
             log.warning("  [loss] 응답 %d B 손실 모의", len(data))
@@ -69,10 +77,12 @@ class VehicleServer(asyncio.DatagramProtocol):
             request_id=req.request_id, request_status=status,
             payload=Payload(type_, {"result": result, **body}))
         data = env.encode(resp)
-        key = (req.originating, req.request_id)
-        if key in self.handled:
-            self.handled[key].last_response = data
-            self.handled[key].addr = addr
+        h = self.handled.get((req.originating, req.request_id))
+        if h is not None:
+            h.last_response = data
+            h.addr = addr
+            h.t = time.monotonic()
+            h.final = status in env.FINAL_STATUSES
         log.info("→ %s req=%d status=%d result=%s", type_, req.request_id, status, result)
         self._send(data, addr)
 
@@ -109,7 +119,7 @@ class VehicleServer(asyncio.DatagramProtocol):
 
     def _expire_dedup(self) -> None:
         now = time.monotonic()
-        for k in [k for k, v in self.handled.items() if now - v.t > DEDUP_TTL_S]:
+        for k in [k for k, v in self.handled.items() if v.final and now - v.t > DEDUP_TTL_S]:
             del self.handled[k]
 
     # ------------------------------------------------------------ VML 처리
