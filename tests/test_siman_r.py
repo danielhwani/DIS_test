@@ -131,6 +131,18 @@ class Handshake(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lost, {env.STATUS_EXECUTING, env.STATUS_COMPLETE})
         self.assertEqual(self.srv.executions, 2)            # 접속 1 + 명령 1, 재질의로 재실행 없음
 
+    async def test_no_poll_while_responses_keep_arriving(self):
+        """응답 간격이 재질의 주기보다 짧으면 상태 재질의를 보내지 않는다."""
+        self.srv.op_durations = (0.15, 0.15)
+        params = ReliabilityParams(response_timeout_s=0.2, max_retries=3,
+                                   status_poll_interval_s=0.25, completion_timeout_s=3.0)
+        c = ConsoleClient(OCU, 1, self.addr, params)
+        self.transports.append(await open_client(c, ("127.0.0.1", 0)))
+        await self.connect(c)
+        r = await c.request(VEH, "Command_AutonomousOperation", {"operation": "START"})
+        self.assertEqual(r.final.request_status, env.STATUS_COMPLETE)
+        self.assertEqual(r.polls, 0)
+
     async def test_poll_does_not_reexecute_after_dedup_ttl(self):
         """명령이 중복 기록 유지 시간(TTL)보다 오래 걸려도 진행 중 항목은 만료되지 않는다."""
         old = vehicle_server.DEDUP_TTL_S

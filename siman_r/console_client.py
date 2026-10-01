@@ -3,7 +3,8 @@
 - 응답을 기대하는 요청마다 Request ID를 부여한다. 카운터 시작값은 부팅 시각 기반 (5.3절).
 - 응답 대기 시간 초과 시 같은 Request ID로 재전송한다 (10.9절 예시 1).
 - 같은 Request ID의 첫 응답(Pending 포함)을 받으면 빠른 재전송을 멈추고 최종 상태까지 기다린다.
-  기다리는 동안 status_poll_interval_s마다 같은 Request ID로 다시 보내 최신 상태를 묻는다.
+  기다리는 동안 차량에서 status_poll_interval_s 동안 아무 응답이 없으면 같은 Request ID로 다시 보내
+  최신 상태를 묻는다. 응답이 오고 있으면 묻지 않는다.
   차량은 이를 중복 요청으로 보고 재실행 없이 최신 응답만 돌려주므로, Executing·Complete 응답이
   손실되어도 다음 재질의에서 복구된다.
 - 자기 앞(Receiving ID)이 아니거나 이미 포기한 Request ID의 응답은 무시한다.
@@ -53,6 +54,7 @@ class _Pending:
         self.result = result
         self.first = asyncio.Event()
         self.done = asyncio.Event()
+        self.last_activity = time.monotonic()   # 마지막 응답 수신 또는 상태 재질의 시각
 
 
 class ConsoleClient(asyncio.DatagramProtocol):
@@ -89,6 +91,7 @@ class ConsoleClient(asyncio.DatagramProtocol):
         if p is None:
             log.info("  (무시) 대기하지 않는 req=%d 응답", pdu.request_id)
             return
+        p.last_activity = time.monotonic()
         statuses = [r.request_status for r in p.result.responses]
         if statuses and statuses[-1] == pdu.request_status:
             return                                  # 재송신된 같은 응답
@@ -131,19 +134,22 @@ class ConsoleClient(asyncio.DatagramProtocol):
     async def _wait_final(self, p: _Pending, data: bytes, rid: int) -> None:
         deadline = time.monotonic() + self.params.completion_timeout_s
         while not p.done.is_set():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            now = time.monotonic()
+            if now >= deadline:
                 p.result.timed_out = True
                 log.error("  req=%d 완료 대기 시간 초과", rid)
                 return
+            next_poll = p.last_activity + self.params.status_poll_interval_s
+            if now >= next_poll:
+                p.result.polls += 1
+                p.last_activity = now
+                log.info("→ req=%d 상태 재질의 (%d회)", rid, p.result.polls)
+                self._send(data)
+                continue
             try:
-                await asyncio.wait_for(p.done.wait(),
-                                       min(self.params.status_poll_interval_s, remaining))
+                await asyncio.wait_for(p.done.wait(), min(next_poll, deadline) - now)
             except asyncio.TimeoutError:
-                if time.monotonic() < deadline:
-                    p.result.polls += 1
-                    log.info("→ req=%d 상태 재질의 (%d회)", rid, p.result.polls)
-                    self._send(data)
+                pass
 
 
 async def open_client(client: ConsoleClient, local=("0.0.0.0", 0)):
