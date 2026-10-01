@@ -184,7 +184,7 @@ class VehicleServer(asyncio.DatagramProtocol):
         plan_s, done_s = self.op_durations
         await asyncio.sleep(plan_s)
         self.mode = "AUTONOMOUS"
-        self._respond(req, addr, "IN_PROGRESS", {"detail": "경로 계획 완료, 출발"},
+        self._respond(req, addr, "IN_PROGRESS", {"detail": "주행 시작 (경로 계획 완료)"},
                       "Response_CommandResult")
         await asyncio.sleep(done_s)
         self.mode = "STANDBY"

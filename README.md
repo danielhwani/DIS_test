@@ -87,8 +87,8 @@ VML(차량 관리), C-BML(임무), 시나리오·환경 관리 메시지는 모�
 ```bash
 cd ~/DIS_test
 
-# 테스트
-python3 -m unittest -v tests.test_siman_r
+# 테스트 (tests/ 아래 전부)
+python3 -m unittest -v
 
 # 터미널 1: 차량 서버 (--drop 0.3 = 응답 30% 손실 모의, Ctrl+C로 종료)
 python3 -m siman_r.vehicle_server --port 3000 --drop 0.3
@@ -110,7 +110,53 @@ sudo tc qdisc add dev lo root netem delay 150ms 50ms loss 15%
 sudo tc qdisc del dev lo root
 ```
 
-## 테스트가 확인하는 것 (`tests/test_siman_r.py`)
+## 기록과 재생 (`siman_r/recorder.py`, `player.py`, `monitor.py`)
+
+콘솔과 차량 사이에 **기록 중계기**를 두고, 오가는 PDU를 양방향 모두 저장한다. 설계 문서 11장의 게이트웨이 위치 로거에 해당한다. 콘솔·차량 코드는 바꾸지 않으므로 나중에 UE5나 소대 시뮬레이션처럼 코드를 고칠 수 없는 체계 사이에도 그대로 끼울 수 있다.
+
+```
+콘솔 ──▶ 기록 중계기(:3001) ──▶ 차량(:3000)
+콘솔 ◀── 기록 중계기        ◀── 차량
+              │
+              ├─ recordings/session_<시각>.jsonl   원본 바이트 + 해석 필드 (한 줄 = 한 패킷)
+              └─ recordings/session_<시각>.pcap    Wireshark로 바로 열람
+```
+
+- **JSONL 한 줄:** 기록 시작 후 경과 시간(`t_rel`), UTC 시각, 방향, 실제 송수신 주소, 헤더 필드(Exercise ID, PDU 종류), SIMAN-R 필드(Entity ID, Request ID, Request Status), JSON 페이로드, 원본 바이트(`raw`, hex). 해석 필드는 원본 바이트에서 언제든 다시 만들 수 있으며, 재생은 원본 바이트만 사용한다 (설계 문서 11.1절의 원본 층·해석 층).
+- **pcap:** 이더넷 없이 IPv4/UDP 헤더만 붙인다(LINKTYPE_IPV4). 주소는 중계기가 아니라 실제 콘솔·차량 주소로 남긴다. Wireshark는 UDP 3000번을 DIS로 해석하므로, 차량 포트가 다르면 "Decode As → DIS"로 지정한다.
+- **재생(playback):** 원본 바이트를 원래 시간 간격대로 다시 송출한다. 재생한 명령이 실차에 닿지 않도록 **Exercise ID를 99로 바꿔** 보내고, 기록과 같은 Exercise ID는 지정할 수 없다. 꼭 그대로 보내야 하면 `--keep-exercise`를 명시한다 (설계 문서 11.4절).
+- **모니터:** 받은 PDU를 해석해 한 줄씩 출력하는 수신기. 재생 결과를 눈으로 확인하는 용도.
+
+```bash
+# 녹화: 터미널 3개
+python3 -m siman_r.vehicle_server --port 3000 --drop 0.3          # 터미널 1: 차량
+python3 -m siman_r.recorder --listen 3001 --vehicle 127.0.0.1:3000 # 터미널 2: 기록 중계기 (Ctrl+C로 종료·저장)
+python3 -m siman_r.console_client --vehicle 127.0.0.1:3001         # 터미널 3: 콘솔은 중계기(3001)로 보낸다
+
+# 재생
+python3 -m siman_r.player recordings/session_<시각>.jsonl --print --speed 0   # 화면에 타임라인만
+python3 -m siman_r.monitor --port 4000                                        # 수신기 (다른 터미널)
+python3 -m siman_r.player recordings/session_<시각>.jsonl --target 127.0.0.1:4000 --speed 2
+python3 -m siman_r.player recordings/session_<시각>.jsonl --target 127.0.0.1:3000 --from console
+#   ↑ 차량으로 보내면 Exercise ID가 달라 "✗ Exercise ID 99 거부"로 버려진다 (안전 격리 확인)
+```
+
+`--from console`은 콘솔이 보낸 요청만, `--from vehicle`은 차량이 보낸 응답만 재생한다. `--speed 0`은 기다리지 않고 바로 보낸다.
+
+**색상:** 중계기·재생기·모니터는 메시지 종류별로 줄 색을 바꾼다. 모니터는 방향을 모르므로 방향이 아니라 종류로 구분한다.
+
+| 색 | 메시지 |
+|---|---|
+| 청록 | 요청 (Action Request-R: 접속, 명령, 재전송, 상태 재질의) |
+| 노랑 / 파랑 / 초록 | 응답: 접수(Pending) / 진행(Executing) / 완료(Complete) |
+| 빨강 / 자주 | 응답: 거부·실패(Rejected) / 일시 거부(Retransmit Later) |
+| 굵은 빨강 | 해석 실패한 패킷 |
+
+터미널에 출력할 때만 색을 쓰고, 파일로 저장하거나 파이프로 넘길 때와 `NO_COLOR` 환경 변수가 있을 때는 끈다. `--no-color`로 직접 끌 수도 있다.
+
+한계: 차량 서버의 `--drop`은 차량이 보내기 전에 패킷을 버리므로, 그 손실은 중계기 기록에 나타나지 않는다(보낸 적이 없는 패킷). 기록에서는 응답이 빠진 자리와 콘솔의 재전송·재질의로 드러난다. 실제 무선 손실을 기록으로 보려면 양 끝단에서도 기록해야 한다 (설계 문서 11.2절).
+
+## 테스트가 확인하는 것
 
 - 바이트 배치: 헤더, Entity ID, 신뢰성 필드, Fixed Datum이 설계 문서 4.12.2절의 Hex와 일치하는지, Datum 길이가 비트 단위이고 패딩이 맞는지
 - 인코딩·디코딩 왕복(한글 포함), 모르는 PDU 무시, 길이 필드 불일치 거부, 전체 대상(0xFFFF) 주소 매칭
@@ -123,6 +169,10 @@ sudo tc qdisc del dev lo root
 - 기록 유지 시간보다 오래 걸리는 명령도 재질의로 재실행되지 않음
 - 제어권 없는 명령 거부, 두 번째 콘솔 제어권 거부, 모르는 메시지 UNSUPPORTED
 - 승인되지 않은 Exercise ID는 응답 없이 버림 → 콘솔은 재시도 후 포기
+- (`tests/test_recording.py`) pcap 헤더·IP 체크섬·UDP 포트·페이로드 배치
+- 중계기를 거쳐도 핸드셰이크가 정상이고, 양방향 패킷이 시간 순서대로 모두 기록되며, 해석 필드를 원본 바이트에서 다시 만들 수 있음
+- 메시지 종류별 색상 규칙, 기본값은 색 없음
+- 재생 시 Exercise ID만 바뀌고 나머지 바이트는 원본과 같음, 차량으로 재생한 명령은 실행되지 않음
 
 ## 아직 포함하지 않은 것
 
@@ -132,6 +182,8 @@ sudo tc qdisc del dev lo root
 - Entity State 등 표준 PDU 송신
 - 메시지 인증(HMAC)·암호화: 지금은 같은 네트워크의 누구나 명령을 보낼 수 있다
 - C-BML, 시나리오·환경 관리 언어
+- 재실행(re-execution): 기록에서 명령만 뽑아 시뮬레이터에 새로 입력하는 도구. 지금 재생기에 `--keep-exercise`를 주어 차량으로 보내면, 차량이 그 Request ID를 기억하는 동안(완료 후 60 s)은 중복으로 보고 실행하지 않지만, 차량을 재시작한 뒤라면 **실제로 다시 실행된다**
+- Parquet 변환과 DuckDB 분석 (JSONL은 DuckDB `read_json`으로 바로 읽을 수 있음)
 
 ## 확정이 필요한 값
 
