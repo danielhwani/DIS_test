@@ -63,6 +63,34 @@ def read_records(path: str) -> Iterator[dict[str, Any]]:
                 yield json.loads(line)
 
 
+def load_records(path: str, vehicle_port: int = 3000) -> list[dict[str, Any]]:
+    """재생용 기록 읽기. 기록 중계기의 .jsonl 또는 Wireshark·중계기의 pcap/pcapng.
+
+    캡처 파일에는 방향 정보가 없으므로 차량 포트로 판단한다. 목적지가 차량 포트면
+    console->vehicle, 출발지가 차량 포트면 vehicle->console. 둘 다 아닌 UDP 패킷은 버린다
+    (중계기를 끼운 캡처에서 콘솔↔중계기 구간이 함께 잡혀도 중복되지 않는다).
+    """
+    with open(path, "rb") as f:
+        head = f.read(4)
+    if head[:1] == b"{":
+        return list(read_records(path))
+    from . import pcapread
+    from datetime import datetime, timezone
+    out: list[dict[str, Any]] = []
+    t0 = None
+    for p in pcapread.read_udp(path):
+        if p.dst[1] == vehicle_port:
+            direction = "console->vehicle"
+        elif p.src[1] == vehicle_port:
+            direction = "vehicle->console"
+        else:
+            continue
+        t0 = p.t_epoch if t0 is None else t0
+        t_utc = datetime.fromtimestamp(p.t_epoch, timezone.utc).isoformat(timespec="microseconds")
+        out.append(make_record(p.t_epoch - t0, t_utc, direction, p.src, p.dst, p.payload))
+    return out
+
+
 # ------------------------------------------------------------------ 터미널 색상
 # 방향이 아니라 메시지 종류로 칠한다. 모니터는 방향을 모르지만 종류는 패킷에 들어 있다.
 

@@ -6,6 +6,10 @@
 
     python -m siman_r.player recordings/session_X.jsonl --print            # 화면에 타임라인만
     python -m siman_r.player recordings/session_X.jsonl --target 127.0.0.1:4000   # 모니터로 송출
+    python -m siman_r.player capture.pcapng --print        # Wireshark에서 저장한 캡처도 가능
+
+pcap/pcapng는 차량 포트(--vehicle-port, 기본 3000)로 방향을 판단하고, 그 포트를 지나지 않는
+패킷은 버린다.
 """
 from __future__ import annotations
 
@@ -51,7 +55,9 @@ def play(records: list[dict], target: tuple | None, exercise_id: int | None,
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("recording", help="recorder가 만든 .jsonl")
+    ap.add_argument("recording", help="recorder가 만든 .jsonl, 또는 .pcap/.pcapng 캡처")
+    ap.add_argument("--vehicle-port", type=int, default=3000,
+                    help="pcap/pcapng에서 방향을 판단할 차량 포트 (기본 3000)")
     ap.add_argument("--target", help="송출 주소 host:port. 생략하면 --print와 같음")
     ap.add_argument("--print", action="store_true", help="송출 없이 타임라인만 출력")
     ap.add_argument("--speed", type=float, default=1.0, help="배속. 0이면 기다리지 않음")
@@ -64,7 +70,9 @@ def main() -> None:
     ap.add_argument("--no-color", action="store_true", help="색상 끄기")
     a = ap.parse_args()
 
-    records = list(pdulog.read_records(a.recording))
+    records = pdulog.load_records(a.recording, a.vehicle_port)
+    if not records:
+        ap.error(f"재생할 패킷이 없다 (pcap이면 차량 포트 {a.vehicle_port}을 지나는 UDP 패킷이 있는지 확인)")
     recorded = {r.get("exercise_id") for r in records}
     target = None
     if a.target and not a.print:

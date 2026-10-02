@@ -29,6 +29,69 @@ class PcapFormat(unittest.TestCase):
         self.assertEqual(data[68:], payload)
 
 
+def _pcapng(frames, tsresol=None):
+    """최소 pcapng: SHB + IDB(Ethernet) + EPB들. frames = [(타임스탬프 정수, 이더넷 프레임)]"""
+    def block(btype, body):
+        body += b"\0" * ((-len(body)) % 4)
+        n = 12 + len(body)
+        return struct.pack("<II", btype, n) + body + struct.pack("<I", n)
+    out = block(0x0A0D0D0A, struct.pack("<IHHq", 0x1A2B3C4D, 1, 0, -1))
+    opts = b""
+    if tsresol is not None:
+        opts = struct.pack("<HHB3x", 9, 1, tsresol) + struct.pack("<HH", 0, 0)
+    out += block(1, struct.pack("<HHI", 1, 0, 65535) + opts)
+    for ts, fr in frames:
+        out += block(6, struct.pack("<IIIII", 0, ts >> 32, ts & 0xFFFFFFFF, len(fr), len(fr)) + fr)
+    return out
+
+
+def _eth_udp(src, dst, payload):
+    udp = struct.pack(">HHHH", src[1], dst[1], 8 + len(payload), 0) + payload
+    ip = struct.pack(">BBHHHBBH4s4s", 0x45, 0, 20 + len(udp), 0, 0x4000, 64, 17, 0,
+                     socket.inet_aton(src[0]), socket.inet_aton(dst[0]))
+    return b"\0" * 12 + b"\x08\x00" + ip + udp
+
+
+class CaptureFiles(unittest.TestCase):
+    def setUp(self):
+        self.req = env.encode(env.ActionRequestR(1, OCU, VEH, 7, env.Payload("Request_Connection")))
+        self.resp = env.encode(env.ActionResponseR(1, VEH, OCU, 7, 4, env.Payload("Response_Connection")))
+        self.dir = tempfile.mkdtemp()
+
+    def check(self, recs):
+        self.assertEqual([r["dir"] for r in recs], ["console->vehicle", "vehicle->console"])
+        self.assertEqual([bytes.fromhex(r["raw"]) for r in recs], [self.req, self.resp])
+        self.assertAlmostEqual(recs[1]["t_rel"], 0.25, places=6)
+
+    def test_pcapng_ethernet_with_noise(self):
+        c, v, relay = ("127.0.0.1", 40000), ("127.0.0.1", 3000), ("127.0.0.1", 3001)
+        for tsresol, scale in ((None, 10**6), (9, 10**9)):        # 마이크로초, 나노초
+            path = os.path.join(self.dir, f"w{tsresol}.pcapng")
+            with open(path, "wb") as f:
+                f.write(_pcapng([
+                    (10 * scale, _eth_udp(c, relay, self.req)),           # 콘솔→중계기 구간: 버림
+                    (10 * scale, _eth_udp(c, v, self.req)),
+                    (int(10.1 * scale), _eth_udp(("127.0.0.1", 5353), ("127.0.0.1", 5353), b"x")),
+                    (int(10.25 * scale), _eth_udp(v, c, self.resp)),
+                ], tsresol))
+            self.check(pdulog.load_records(path))
+
+    def test_recorder_pcap_matches_jsonl(self):
+        path = os.path.join(self.dir, "r.pcap")
+        with open(path, "wb") as f:
+            w = pdulog.PcapWriter(f)
+            w.write(100.0, ("127.0.0.1", 40000), ("127.0.0.1", 3000), self.req)
+            w.write(100.25, ("127.0.0.1", 3000), ("127.0.0.1", 40000), self.resp)
+        self.check(pdulog.load_records(path))
+
+    def test_vehicle_port_option(self):
+        path = os.path.join(self.dir, "p.pcapng")
+        with open(path, "wb") as f:
+            f.write(_pcapng([(0, _eth_udp(("127.0.0.1", 40000), ("127.0.0.1", 3002), self.req))]))
+        self.assertEqual(pdulog.load_records(path), [])
+        self.assertEqual(len(pdulog.load_records(path, vehicle_port=3002)), 1)
+
+
 class Colors(unittest.TestCase):
     def rec(self, pdu):
         return {"t_rel": 0.0, "dir": "x", **pdulog.summarize(env.encode(pdu))}

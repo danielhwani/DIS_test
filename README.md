@@ -110,7 +110,7 @@ sudo tc qdisc add dev lo root netem delay 150ms 50ms loss 15%
 sudo tc qdisc del dev lo root
 ```
 
-## 기록과 재생 (`siman_r/recorder.py`, `player.py`, `monitor.py`)
+## 기록과 재생 (`siman_r/recorder.py`, `player.py`, `monitor.py`, `pcapread.py`)
 
 콘솔과 차량 사이에 **기록 중계기**를 두고, 오가는 PDU를 양방향 모두 저장한다. 설계 문서 11장의 게이트웨이 위치 로거에 해당한다. 콘솔·차량 코드는 바꾸지 않으므로 나중에 UE5나 소대 시뮬레이션처럼 코드를 고칠 수 없는 체계 사이에도 그대로 끼울 수 있다.
 
@@ -124,7 +124,7 @@ sudo tc qdisc del dev lo root
 
 - **JSONL 한 줄:** 기록 시작 후 경과 시간(`t_rel`), UTC 시각, 방향, 실제 송수신 주소, 헤더 필드(Exercise ID, PDU 종류), SIMAN-R 필드(Entity ID, Request ID, Request Status), JSON 페이로드, 원본 바이트(`raw`, hex). 해석 필드는 원본 바이트에서 언제든 다시 만들 수 있으며, 재생은 원본 바이트만 사용한다 (설계 문서 11.1절의 원본 층·해석 층).
 - **pcap:** 이더넷 없이 IPv4/UDP 헤더만 붙인다(LINKTYPE_IPV4). 주소는 중계기가 아니라 실제 콘솔·차량 주소로 남긴다. Wireshark는 UDP 3000번을 DIS로 해석하므로, 차량 포트가 다르면 "Decode As → DIS"로 지정한다.
-- **재생(playback):** 원본 바이트를 원래 시간 간격대로 다시 송출한다. 재생한 명령이 실차에 닿지 않도록 **Exercise ID를 99로 바꿔** 보내고, 기록과 같은 Exercise ID는 지정할 수 없다. 꼭 그대로 보내야 하면 `--keep-exercise`를 명시한다 (설계 문서 11.4절).
+- **재생(playback):** 원본 바이트를 원래 시간 간격대로 다시 송출한다. 중계기의 `.jsonl`·`.pcap`뿐 아니라 Wireshark·tshark로 저장한 `.pcapng`도 재생할 수 있다 (아래 "Wireshark 캡처"). 재생한 명령이 실차에 닿지 않도록 **Exercise ID를 99로 바꿔** 보내고, 기록과 같은 Exercise ID는 지정할 수 없다. 꼭 그대로 보내야 하면 `--keep-exercise`를 명시한다 (설계 문서 11.4절).
 - **모니터:** 받은 PDU를 해석해 한 줄씩 출력하는 수신기. 재생 결과를 눈으로 확인하는 용도.
 
 ```bash
@@ -154,6 +154,26 @@ python3 -m siman_r.player recordings/session_<시각>.jsonl --target 127.0.0.1:3
 
 터미널에 출력할 때만 색을 쓰고, 파일로 저장하거나 파이프로 넘길 때와 `NO_COLOR` 환경 변수가 있을 때는 끈다. `--no-color`로 직접 끌 수도 있다.
 
+### Wireshark 캡처
+
+**실시간 캡처 준비 (처음 한 번):** `sudo apt install wireshark tshark`로 설치하고, 설치 중 "Should non-superusers be able to capture packets?"에 Yes를 고른 뒤 `sudo usermod -aG wireshark $USER`를 실행하고 **다시 로그인**한다. 다시 로그인하기 전에 GUI로 캡처하면 `Couldn't run /usr/bin/dumpcap in child process: Permission denied`가 난다 (`id -nG`에 `wireshark`가 있는지 확인).
+
+**GUI로 캡처:** `wireshark &` → 시작 화면 Capture 영역의 `...using this filter:` 칸에 `udp port 3000` 입력 → 인터페이스 목록에서 `Loopback: lo` 더블클릭 → 위쪽 표시 필터 칸에 `dis` 입력. 그다음 차량과 콘솔을 실행한다. 캡처 필터를 비워 두면 DNS 등 다른 패킷도 파일에 함께 저장된다 (표시 필터 `dis`는 화면에서만 거른다).
+
+**터미널로 캡처:** `tshark -i lo -f "udp port 3000"` (저장하려면 `-w recordings/x.pcapng`)
+
+**캡처 파일 재생:** 재생기가 파일 내용을 보고 JSONL·pcap·pcapng를 구분하므로 옵션은 같다.
+
+```bash
+python3 -m siman_r.player recordings/gui_capture_test.pcapng --print
+python3 -m siman_r.player recordings/gui_capture_test.pcapng --target 127.0.0.1:4000 --speed 2
+```
+
+- 캡처 파일에는 방향 정보가 없으므로 **차량 포트(기본 3000)**로 판단한다. 목적지가 3000이면 `console->vehicle`, 출발지가 3000이면 `vehicle->console`이고, 3000을 지나지 않는 패킷(DNS 등)은 버린다. 중계기를 끼우고 3000-3001을 함께 캡처해도 콘솔↔중계기 구간은 빠지므로 같은 패킷이 두 번 재생되지 않는다.
+- 차량을 다른 포트로 띄웠다면 `--vehicle-port 3002`처럼 지정한다.
+- 지원 형식: pcap(마이크로·나노초), pcapng(시각 단위 옵션 포함), 링크 계층 Ethernet(VLAN 포함)·Linux cooked(SLL/SLL2)·loopback·raw IPv4. IPv4 위 UDP만 다루고, 조각난 IP 패킷은 건너뛴다.
+- 재생한 패킷을 Wireshark로 다시 보려면 4000번처럼 DIS 기본 포트가 아닌 곳은 패킷 오른쪽 클릭 → **Decode As...** → `DIS`로 지정한다.
+
 한계: 차량 서버의 `--drop`은 차량이 보내기 전에 패킷을 버리므로, 그 손실은 중계기 기록에 나타나지 않는다(보낸 적이 없는 패킷). 기록에서는 응답이 빠진 자리와 콘솔의 재전송·재질의로 드러난다. 실제 무선 손실을 기록으로 보려면 양 끝단에서도 기록해야 한다 (설계 문서 11.2절).
 
 ## 테스트가 확인하는 것
@@ -173,6 +193,7 @@ python3 -m siman_r.player recordings/session_<시각>.jsonl --target 127.0.0.1:3
 - 중계기를 거쳐도 핸드셰이크가 정상이고, 양방향 패킷이 시간 순서대로 모두 기록되며, 해석 필드를 원본 바이트에서 다시 만들 수 있음
 - 메시지 종류별 색상 규칙, 기본값은 색 없음
 - 재생 시 Exercise ID만 바뀌고 나머지 바이트는 원본과 같음, 차량으로 재생한 명령은 실행되지 않음
+- pcapng(마이크로초·나노초 시각 단위)와 중계기 pcap 읽기, 차량 포트로 방향 판단, 다른 포트·잡음 패킷 제외, `--vehicle-port`
 
 ## 아직 포함하지 않은 것
 
