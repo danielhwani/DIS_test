@@ -141,7 +141,8 @@ class RecordAndReplay(unittest.IsolatedAsyncioTestCase):
         r = await self.run_session()
         self.assertEqual(r.final.request_status, env.STATUS_COMPLETE)   # 중계를 거쳐도 핸드셰이크 정상
         self.rec.close()
-        recs = list(pdulog.read_records(self.out + ".jsonl"))
+        recs = [x for x in pdulog.read_records(self.out + ".jsonl")
+                if x["pdu_type"] != env.PDU_DATA]             # heartbeat·주기 보고 제외
         self.assertEqual([x["dir"] for x in recs],
                          ["console->vehicle", "vehicle->console", "console->vehicle"]
                          + ["vehicle->console"] * 3)

@@ -1,6 +1,6 @@
 """DIS 공통 봉투 (opcon_autonomy_comm_v8 4장·5장).
 
-SIMAN-R Action Request-R(56) / Action Response-R(57) PDU에
+SIMAN-R Action Request-R(56) / Action Response-R(57) PDU와 기본 SIMAN Data PDU(20)에
 Fixed Datum 3개(PAYLOAD_LANG/VERSION/ENCODING) + Variable Datum 1개(PAYLOAD_BODY, JSON)를
 싣고 푸는 코드. 모든 필드는 빅엔디언 (IEEE 1278.1-2012).
 """
@@ -13,7 +13,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 PROTOCOL_VERSION = 7          # DIS 7
+FAMILY_SIMAN = 5              # Simulation Management
 FAMILY_SIMAN_R = 10           # Simulation Management with Reliability
+
+PDU_DATA = 20                 # 확인 없는 주기 보고·heartbeat (4.12절)
 
 PDU_ACTION_REQUEST_R = 56
 PDU_ACTION_RESPONSE_R = 57
@@ -146,14 +149,32 @@ def _datum_records(p: Payload) -> bytes:
     return struct.pack(">II", 3, 1) + fixed + var
 
 
-def _header(pdu_type: int, exercise_id: int, timestamp: int, length: int) -> bytes:
+@dataclass
+class DataPdu:
+    """기본 SIMAN Data PDU (4.12.1절). 자발 송신이면 request_id = 0."""
+    exercise_id: int
+    originating: EntityId
+    receiving: EntityId
+    payload: Payload
+    request_id: int = 0
+    timestamp: int = 0
+    pdu_type: int = PDU_DATA
+
+
+def _header(pdu_type: int, exercise_id: int, timestamp: int, length: int,
+            family: int = FAMILY_SIMAN_R) -> bytes:
     return struct.pack(HEADER_FMT, PROTOCOL_VERSION, exercise_id, pdu_type,
-                       FAMILY_SIMAN_R, timestamp, length, 0)
+                       family, timestamp, length, 0)
 
 
-def encode(pdu: ActionRequestR | ActionResponseR) -> bytes:
+def encode(pdu: ActionRequestR | ActionResponseR | DataPdu) -> bytes:
     ts = pdu.timestamp or dis_timestamp()
-    if isinstance(pdu, ActionRequestR):
+    family = FAMILY_SIMAN_R
+    if isinstance(pdu, DataPdu):
+        family = FAMILY_SIMAN
+        fields = (pdu.originating.pack() + pdu.receiving.pack()
+                  + struct.pack(">I4x", pdu.request_id))
+    elif isinstance(pdu, ActionRequestR):
         fields = (pdu.originating.pack() + pdu.receiving.pack()
                   + struct.pack(">B3xII", pdu.reliability, pdu.request_id, pdu.action_id))
     else:
@@ -163,7 +184,7 @@ def encode(pdu: ActionRequestR | ActionResponseR) -> bytes:
     length = 12 + len(rest)
     if length > MAX_PDU_SIZE:
         raise ValueError(f"PDU {length} B > {MAX_PDU_SIZE} B")
-    return _header(pdu.pdu_type, pdu.exercise_id, ts, length) + rest
+    return _header(pdu.pdu_type, pdu.exercise_id, ts, length, family) + rest
 
 
 # ---------------------------------------------------------------- 디코딩
@@ -222,14 +243,20 @@ def _decode_datums(data: bytes, off: int) -> Payload:
         raise DecodeError(f"bad JSON payload: {e}") from e
 
 
-def decode(data: bytes) -> ActionRequestR | ActionResponseR | None:
+def decode(data: bytes) -> ActionRequestR | ActionResponseR | DataPdu | None:
     """처리기가 있는 PDU만 디코딩하고, 모르는 PDU는 None (4.3절: 무시)."""
     h = peek_header(data)
-    if h.version != PROTOCOL_VERSION or h.family != FAMILY_SIMAN_R:
+    if h.version != PROTOCOL_VERSION or (h.family, h.pdu_type) not in (
+            (FAMILY_SIMAN_R, PDU_ACTION_REQUEST_R), (FAMILY_SIMAN_R, PDU_ACTION_RESPONSE_R),
+            (FAMILY_SIMAN, PDU_DATA)):
         return None
     try:
         orig = EntityId(*struct.unpack_from(ENTITY_FMT, data, 12))
         recv = EntityId(*struct.unpack_from(ENTITY_FMT, data, 18))
+        if h.pdu_type == PDU_DATA:
+            (req_id,) = struct.unpack_from(">I", data, 24)
+            return DataPdu(h.exercise_id, orig, recv, _decode_datums(data, 32), req_id,
+                           h.timestamp)
         if h.pdu_type == PDU_ACTION_REQUEST_R:
             rel, req_id, action_id = struct.unpack_from(">B3xII", data, 24)
             return ActionRequestR(h.exercise_id, orig, recv, req_id,

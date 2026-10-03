@@ -73,7 +73,8 @@ def load_records(path: str, vehicle_port: int = 3000) -> list[dict[str, Any]]:
     with open(path, "rb") as f:
         head = f.read(4)
     if head[:1] == b"{":
-        return list(read_records(path))
+        # 중계기가 링크 차단 중 버린 패킷은 실제로 전달되지 않았으므로 재생하지 않는다
+        return [r for r in read_records(path) if not r.get("dropped")]
     from . import pcapread
     from datetime import datetime, timezone
     out: list[dict[str, Any]] = []
@@ -106,10 +107,12 @@ _C_STATUS = {
 }
 _C_ERROR = "\033[1;31m"           # 굵은 빨강: 해석 실패
 _C_OTHER = "\033[2m"              # 흐리게: 처리기 없는 PDU
+_C_DATA = "\033[90m"              # 회색: 주기 보고·heartbeat (Data PDU)
 
 LEGEND = ("색상: " + _C_REQUEST + "요청" + RESET + "  응답 " + _C_STATUS[1] + "접수" + RESET
           + " " + _C_STATUS[2] + "진행" + RESET + " " + _C_STATUS[4] + "완료" + RESET
-          + " " + _C_STATUS[5] + "거부" + RESET + " " + _C_STATUS[7] + "일시거부" + RESET)
+          + " " + _C_STATUS[5] + "거부" + RESET + " " + _C_STATUS[7] + "일시거부" + RESET
+          + "  " + _C_DATA + "주기보고·heartbeat" + RESET)
 
 
 def use_color(stream) -> bool:
@@ -123,6 +126,8 @@ def record_color(r: dict[str, Any]) -> str:
         return _C_ERROR
     if "payload_type" not in r:
         return _C_OTHER
+    if r.get("pdu_type") == env.PDU_DATA:
+        return _C_DATA
     if "request_status" in r:
         return _C_STATUS.get(r["request_status"], "")
     return _C_REQUEST

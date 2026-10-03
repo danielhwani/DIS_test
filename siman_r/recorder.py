@@ -6,6 +6,8 @@
 - 콘솔마다 차량 쪽 소켓을 따로 열어, 차량이 보낸 응답을 원래 콘솔에게 돌려준다.
 - 패킷은 바꾸지 않고 전달한다. 기록에는 중계기 주소가 아니라 실제 콘솔·차량 주소를 남긴다.
 - 출력: <out>.jsonl (원본 + 해석 층), <out>.pcap (Wireshark용)
+- 링크 차단 모의: 중계기 터미널에서 Enter를 누르면 양방향 전달을 멈추고(통신 두절), 다시 누르면
+  복구한다. 차단 중 버린 패킷은 JSONL에 "dropped": "link_cut"으로 남기고 pcap에는 쓰지 않는다.
 
 실행: python -m siman_r.recorder --listen 3001 --vehicle 127.0.0.1:3000
 """
@@ -33,16 +35,22 @@ class Recorder:
         self.count = 0
         self.color = color
 
-    def record(self, direction: str, src: tuple, dst: tuple, data: bytes) -> None:
+    def record(self, direction: str, src: tuple, dst: tuple, data: bytes,
+               dropped: str | None = None) -> None:
+        if self.jsonl.closed:                  # 종료 중에 도착한 패킷
+            return
         now = time.time()
         t_utc = datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="microseconds")
         r = pdulog.make_record(time.monotonic() - self.t0, t_utc, direction, src, dst, data)
+        if dropped:
+            r["dropped"] = dropped
         self.jsonl.write(json.dumps(r, ensure_ascii=False) + "\n")
         self.jsonl.flush()
-        if self.pcap:
+        if self.pcap and not dropped:
             self.pcap.write(now, src, dst, data)
         self.count += 1
-        log.info("%s", pdulog.format_record(r, self.color))
+        line = pdulog.format_record(r, self.color)
+        log.info("%s%s", "[차단·버림] " if dropped else "", line)
 
     def close(self) -> None:
         self.jsonl.close()
@@ -62,6 +70,10 @@ class _Upstream(asyncio.DatagramProtocol):
         self.transport = transport
 
     def datagram_received(self, data: bytes, addr) -> None:
+        if self.relay.blocked:
+            self.relay.recorder.record("vehicle->console", addr, self.console_addr, data,
+                                       dropped="link_cut")
+            return
         self.relay.recorder.record("vehicle->console", addr, self.console_addr, data)
         self.relay.transport.sendto(data, self.console_addr)
 
@@ -72,11 +84,21 @@ class Relay(asyncio.DatagramProtocol):
         self.recorder = recorder
         self.upstreams: dict[tuple, _Upstream] = {}
         self.transport: asyncio.DatagramTransport | None = None
+        self.blocked = False                  # True면 양방향 전달 중단 (통신 두절 모의)
 
     def connection_made(self, transport):
         self.transport = transport
 
+    def set_blocked(self, blocked: bool) -> None:
+        self.blocked = blocked
+        log.warning("■ 링크 %s", "차단 (통신 두절 모의) — Enter로 복구" if blocked
+                    else "복구 — Enter로 다시 차단")
+
     def datagram_received(self, data: bytes, addr) -> None:
+        if self.blocked:
+            self.recorder.record("console->vehicle", addr, self.vehicle_addr, data,
+                                 dropped="link_cut")
+            return
         self.recorder.record("console->vehicle", addr, self.vehicle_addr, data)
         up = self.upstreams.get(addr)
         if up is not None and up.transport is not None:
@@ -109,6 +131,23 @@ async def start_relay(listen: tuple, vehicle_addr: tuple, recorder: Recorder) ->
     return relay
 
 
+def _watch_enter(relay: Relay) -> None:
+    """표준 입력의 한 줄(Enter)마다 링크 차단/복구를 토글한다."""
+    loop = asyncio.get_running_loop()
+    fd = sys.stdin.fileno()
+
+    def on_line():
+        if not sys.stdin.readline():           # EOF (입력이 /dev/null 등): 감시 중단
+            loop.remove_reader(fd)
+            return
+        relay.set_blocked(not relay.blocked)
+    try:
+        loop.add_reader(fd, on_line)
+        log.info("Enter: 링크 차단/복구 토글 (통신 두절 모의)")
+    except (OSError, ValueError, NotImplementedError):
+        pass
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--listen", default="127.0.0.1:3001", help="콘솔이 보낼 주소 (host:port 또는 port)")
@@ -129,11 +168,12 @@ def main() -> None:
     rec = Recorder(out + ".jsonl", None if a.no_pcap else out + ".pcap", color)
 
     async def run():
-        await start_relay(listen, (vhost, int(vport)), rec)
+        relay = await start_relay(listen, (vhost, int(vport)), rec)
         log.info("기록 중계 udp://%s:%d → %s:%s, 저장 %s.jsonl%s",
                  *listen, vhost, vport, out, "" if a.no_pcap else " / .pcap")
         if color:
             log.info("%s", pdulog.LEGEND)
+        _watch_enter(relay)
         await asyncio.Event().wait()
     try:
         asyncio.run(run())

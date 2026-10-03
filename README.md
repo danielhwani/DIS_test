@@ -15,7 +15,7 @@ VML(차량 관리), C-BML(임무), 시나리오·환경 관리 메시지는 모�
 | 영역 | 내용 |
 |---|---|
 | 공통 헤더 (12 B) | DIS 7, Exercise ID, PDU Type, Protocol Family 10(SIMAN-R), 절대시간 타임스탬프 |
-| PDU | Action Request-R(56): 송신·수신 Entity ID, Required Reliability Service, Request ID, Action ID<br>Action Response-R(57): 송신·수신 Entity ID, Request ID, Request Status |
+| PDU | Action Request-R(56): 송신·수신 Entity ID, Required Reliability Service, Request ID, Action ID<br>Action Response-R(57): 송신·수신 Entity ID, Request ID, Request Status<br>Data(20, Protocol Family 5 기본 SIMAN): 송신·수신 Entity ID, Request ID(자발 송신 0). 확인 없는 주기 보고·heartbeat용 |
 | Fixed Datum 3개 | PAYLOAD_LANG(2 = VML), PAYLOAD_VERSION(1.0 = 256), PAYLOAD_ENCODING(1 = JSON) |
 | Variable Datum 1개 | PAYLOAD_BODY = `{"type": 메시지명, "body": {...}}` |
 
@@ -35,8 +35,9 @@ VML(차량 관리), C-BML(임무), 시나리오·환경 관리 메시지는 모�
 | 요청 | 응답 | 동작 |
 |---|---|---|
 | `Request_Connection` | `Response_Connection` | 접속, 제어권 부여, 현재 모드·설정 버전·지원 메시지 목록(능력 정보) 응답 |
-| `Command_AutonomousOperation` (START) | `Response_CommandResult` | 같은 Request ID로 Pending → Executing → Complete를 차례로 보냄 (경로 계획 2.5 s, 임무 5 s 모의) |
-| `Command_AutonomousOperation` (STOP) | `Response_CommandResult` | 즉시 Complete |
+| `Command_AutonomousOperation` (START) | `Response_CommandResult` | 같은 Request ID로 Pending → Executing → Complete를 차례로 보냄 (경로 계획 2.5 s, 임무 `--mission-s` 기본 5 s 모의). 다른 임무가 진행 중이면 TEMPORARILY_REJECTED / BUSY |
+| `Command_AutonomousOperation` (STOP) | `Response_CommandResult` | 진행 중 임무를 중단(그 임무는 FAILED / STOPPED_BY_OPERATOR)하고 즉시 Complete |
+| `Report_ConsoleHeartbeat` (Data) | 없음 | 콘솔 생존 신호. 링크 감시 시각만 갱신 |
 | 그 밖의 메시지 | `Response_CommandResult` | UNSUPPORTED (Request Status 5) |
 
 - **손실 모의:** `--drop` 옵션으로 응답 패킷을 일정 확률로 버려 무선 구간 손실을 흉내 낸다.
@@ -47,7 +48,42 @@ VML(차량 관리), C-BML(임무), 시나리오·환경 관리 메시지는 모�
 - **재전송:** 응답이 1초 안에 오지 않으면 같은 Request ID, 같은 바이트로 최대 3회 재전송한다. 그래도 응답이 없으면 포기한다.
 - **상태 재질의:** 첫 응답(Pending 등)을 받은 뒤 최종 상태(Complete·Rejected)를 기다리는 동안, 차량에서 3초 동안 아무 응답이 없으면 같은 Request ID로 다시 보내 최신 상태를 묻는다. 응답이 오고 있으면 묻지 않는다. 차량은 이를 중복 요청으로 처리해 최신 응답만 돌려주므로, Executing·Complete 응답이 손실돼도 복구된다. 30초 안에 최종 상태가 오지 않으면 시간 초과로 처리한다.
 - 자기 앞이 아닌 응답, 이미 포기한 Request ID의 늦은 응답, 같은 상태의 중복 응답은 무시한다.
-- 단독 실행 시 `Request_Connection`으로 접속한 뒤 `Command_AutonomousOperation START`를 보내고 완료까지 기다린다.
+- 단독 실행 시 `Request_Connection`으로 접속한 뒤 `Command_AutonomousOperation START`를 보내고 완료까지 기다린다. `--hold`를 주면 끝난 뒤에도 heartbeat와 링크 감시를 계속한다.
+
+### 4. 링크 감시: 양방향 heartbeat와 통신 두절 (설계 문서 3.3절, 4.12절)
+
+| 방향 | 메시지 | 주기 | 역할 |
+|---|---|---|---|
+| 차량 → 콘솔 | `Report_BasicInformation` (Data PDU) | 1 s | 주기 보고 겸 heartbeat. `mode`, `control_owner`, `active_task_id`, `comm_state`, `settings_version`, `time_utc` |
+| 콘솔 → 차량 | `Report_ConsoleHeartbeat` (Data PDU) | 1 s | 콘솔 생존 신호. `seq`, `link_state`. 설계 문서에 "둔다"고만 되어 있어 이름과 필드는 프로토타입에서 정함 |
+
+둘 다 확인 없는 Data PDU이고, 제어권을 받은 콘솔과 그 차량 사이에서만 오간다. 주기 보고와 heartbeat만이 아니라 응답·요청 등 상대에게서 온 **어떤 PDU든** 생존 신호로 본다.
+
+**차량 쪽 판정과 단절 시 동작**
+- 제어권을 가진 콘솔에게서 5 s(`--comm-lost-timeout`) 동안 아무것도 오지 않으면 통신 두절(`comm_state: LOST`)로 판정하고 단절 시 동작(`--comm-lost-behavior`)을 실행한다.
+  - **STOP (기본):** 진행 중 임무를 중단하고 그 Request ID에 FAILED / `COMM_LOST`를 남긴다. 모드를 `COMM_LOST_STOP`으로 바꾸고 제어권을 해제한다.
+  - **CONTINUE:** 임무를 계속하고 제어권도 유지한다. 링크 상태만 LOST로 보고한다.
+  - 설계 문서의 HOLD, AUTONOMOUS_RETURN과 2차 동작(`secondary_timeout_s`)은 실제 주행 모델이 있어야 의미가 있어 아직 없다.
+- 콘솔의 heartbeat가 다시 들어오면 `comm_state`를 OK로 되돌린다. 해제한 제어권은 돌려주지 않으므로 콘솔이 다시 접속해야 하고, 재접속만으로 중단된 임무가 다시 시작되지는 않는다.
+- 접속 응답(`Response_Connection`)에 두절 판정 시간, 단절 시 동작, 보고 주기를 알려 준다.
+
+**콘솔 쪽 판정**
+- 차량에서 3 s 동안 아무것도 오지 않으면 STALE(정보 갱신 안 됨), 5 s면 LOST(통신 두절)로 판정한다. 다시 수신되면 OK.
+- 주기 보고에서 제어권이 자기에게서 다른 값으로 바뀐 것을 보면 **한 번** 다시 접속해 제어권을 받고 상태를 재동기화한다 (설계 문서 7장). 다른 콘솔이 가져간 경우에는 거부되고 더 시도하지 않는다.
+- 두절 중에도 진행 중 명령의 상태 재질의는 계속된다. 링크가 복구되면 재질의로 FAILED / `COMM_LOST`를 받아 명령이 중단됐음을 안다. 앞서 말한 "콘솔은 포기했는데 차량은 실행 중" 위험도 STOP이면 차량이 스스로 멈추므로 줄어든다.
+
+```
+콘솔                     링크 차단(8 s)                          차량
+ │ heartbeat 1 s ──────────── ✕ ✕ ✕ ✕ ✕ ✕ ✕ ✕ ─────────────────▶│
+ │◀──────────── 주기 보고 1 s ✕ ✕ ✕ ✕ ✕ ✕ ✕ ✕ ───────────────── │
+ │ +3 s STALE                                                    │
+ │ +5 s LOST                                    +5 s 두절 판정 → 임무 중단, COMM_LOST_STOP, 제어권 해제
+ │                  링크 복구                                     │
+ │◀── 주기 보고 (control_owner: null) ─────────────────────────── │
+ │ ── Request_Connection (재접속) ──────────────────────────────▶ │ 제어권 재부여
+ │ ── 상태 재질의 (옛 Request ID) ──────────────────────────────▶ │
+ │◀── FAILED / COMM_LOST ──────────────────────────────────────── │
+```
 
 ### 교환 흐름
 
@@ -90,7 +126,7 @@ cd ~/DIS_test
 # 테스트 (tests/ 아래 전부)
 python3 -m unittest -v
 
-# 터미널 1: 차량 서버 (--drop 0.3 = 응답 30% 손실 모의, Ctrl+C로 종료)
+# 터미널 1: 차량 서버 (--drop 0.3 = 차량 송신 30% 손실 모의, Ctrl+C로 종료)
 python3 -m siman_r.vehicle_server --port 3000 --drop 0.3
 
 # 터미널 2: 콘솔
@@ -109,6 +145,23 @@ sudo tcpdump -i lo -X udp port 3000
 sudo tc qdisc add dev lo root netem delay 150ms 50ms loss 15%
 sudo tc qdisc del dev lo root
 ```
+
+### 통신 두절 시험 (터미널 3개)
+
+기록 중계기 터미널에서 **Enter를 누르면 링크가 끊기고, 다시 Enter를 누르면 복구**된다. 차단 중 버린 패킷은 `[차단·버림]`으로 표시되고 JSONL에 `"dropped": "link_cut"`으로 남는다 (pcap과 재생에서는 빠진다).
+
+```bash
+python3 -m siman_r.vehicle_server --port 3000 --mission-s 30                 # 터미널 1: 임무 30 s
+python3 -m siman_r.recorder --listen 3001 --vehicle 127.0.0.1:3000 --out recordings/commlost   # 터미널 2
+python3 -m siman_r.console_client --vehicle 127.0.0.1:3001 --hold            # 터미널 3
+```
+
+1. 콘솔에 `IN_PROGRESS`가 나오면 터미널 2에서 Enter를 누른다 (링크 차단).
+2. 콘솔: 3 s 뒤 `정보 갱신 안 됨`, 5 s 뒤 `통신 두절`. 차량: 5 s 뒤 `통신 두절 … → 단절 시 동작 STOP`, `임무 중단`, `제어권 해제`.
+3. 터미널 2에서 다시 Enter를 누른다 (복구). 콘솔: `링크 정상` → `제어권 해제 확인 → 재접속` → 재질의로 `FAILED … COMM_LOST`.
+4. 터미널 3에서 Ctrl+C로 콘솔을 끄면, 5 s 뒤 차량이 다시 통신 두절로 판정한다 (콘솔이 꺼진 경우).
+
+중계기 없이도 콘솔 터미널에서 `Ctrl+Z`로 콘솔을 일시 정지하면 heartbeat가 멈춰 같은 상황을 만들 수 있다 (`fg`로 재개). 차량의 단절 시 동작을 바꾸려면 `--comm-lost-behavior CONTINUE`, 판정 시간은 `--comm-lost-timeout 3`.
 
 ## 기록과 재생 (`siman_r/recorder.py`, `player.py`, `monitor.py`, `pcapread.py`)
 
@@ -151,6 +204,7 @@ python3 -m siman_r.player recordings/session_<시각>.jsonl --target 127.0.0.1:3
 | 노랑 / 파랑 / 초록 | 응답: 접수(Pending) / 진행(Executing) / 완료(Complete) |
 | 빨강 / 자주 | 응답: 거부·실패(Rejected) / 일시 거부(Retransmit Later) |
 | 굵은 빨강 | 해석 실패한 패킷 |
+| 회색 | 주기 보고·heartbeat (Data PDU) |
 
 터미널에 출력할 때만 색을 쓰고, 파일로 저장하거나 파이프로 넘길 때와 `NO_COLOR` 환경 변수가 있을 때는 끈다. `--no-color`로 직접 끌 수도 있다.
 
@@ -189,6 +243,11 @@ python3 -m siman_r.player recordings/gui_capture_test.pcapng --target 127.0.0.1:
 - 기록 유지 시간보다 오래 걸리는 명령도 재질의로 재실행되지 않음
 - 제어권 없는 명령 거부, 두 번째 콘솔 제어권 거부, 모르는 메시지 UNSUPPORTED
 - 승인되지 않은 Exercise ID는 응답 없이 버림 → 콘솔은 재시도 후 포기
+- (`tests/test_link.py`) Data PDU 바이트 배치(설계 문서 4.12.2절 Hex)
+- 두절 판정 시간보다 긴 임무도 heartbeat·주기 보고로 링크 유지
+- 링크 차단 → 콘솔 OK→STALE→LOST→OK, 차량 두절 판정 → 임무 FAILED/COMM_LOST·정지·제어권 해제 → 복구 후 재접속, 차단 중 버린 패킷은 `dropped`로 기록되고 재생에서 빠짐
+- CONTINUE면 임무 완료·제어권 유지·재접속 없음, 판정 시간보다 짧은 끊김은 두절로 보지 않음
+- 임무 중 두 번째 START는 BUSY, STOP은 진행 중 임무를 STOPPED_BY_OPERATOR로 중단
 - (`tests/test_recording.py`) pcap 헤더·IP 체크섬·UDP 포트·페이로드 배치
 - 중계기를 거쳐도 핸드셰이크가 정상이고, 양방향 패킷이 시간 순서대로 모두 기록되며, 해석 필드를 원본 바이트에서 다시 만들 수 있음
 - 메시지 종류별 색상 규칙, 기본값은 색 없음
@@ -197,9 +256,11 @@ python3 -m siman_r.player recordings/gui_capture_test.pcapng --target 127.0.0.1:
 
 ## 아직 포함하지 않은 것
 
-- 양방향 heartbeat와 통신 단절 판정, 단절 시 차량 안전 동작 (권장 다음 단계)
 - 제어권 반납·이양 절차
-- Set Data-R / Data-R(설정 명령), Event Report-R(이벤트 보고), Data PDU 1 Hz 주기 보고와 Data Query 구독
+- Set Data-R / Data-R(설정 명령): 단절 시 동작도 지금은 차량 실행 옵션으로만 정하고, `Command_CommLostBehaviorSetting`으로 바꾸는 기능은 없다
+- 단절 시 동작 HOLD, AUTONOMOUS_RETURN과 2차 동작(`secondary_timeout_s`, `secondary_behavior`)
+- Event Report-R(이벤트 보고), Data Query 구독(주기 보고는 지금 고정 1 Hz 자발 송신), 주기 보고의 속도·에너지·건강 상태 필드
+- 주기 보고를 여러 콘솔·시뮬레이터에 멀티캐스트하기 (지금은 제어권 받은 콘솔에게만 유니캐스트)
 - Entity State 등 표준 PDU 송신
 - 메시지 인증(HMAC)·암호화: 지금은 같은 네트워크의 누구나 명령을 보낼 수 있다
 - C-BML, 시나리오·환경 관리 언어
@@ -217,6 +278,8 @@ python3 -m siman_r.player recordings/gui_capture_test.pcapng --target 127.0.0.1:
 | Entity ID | 콘솔 2/1/1, 차량 1/3/1 |
 | Exercise ID | 1 |
 | 신뢰성 운영 파라미터 | 응답 대기 1 s × 재시도 3회, 상태 재질의(무응답 시) 3 s, 완료 대기 30 s, 중복 기록 유지 60 s |
+| 링크 감시 | heartbeat·주기 보고 1 s, 콘솔 STALE 3 s / LOST 5 s, 차량 두절 판정 5 s, 단절 시 동작 STOP |
+| 메시지·값 이름 | `Report_ConsoleHeartbeat`, 모드 `COMM_LOST_STOP`, `comm_state`, reason_code `COMM_LOST` / `STOPPED_BY_OPERATOR` / `BUSY` (설계 문서 모드 열거값에 없음) |
 
 완료 대기 30초는 설계 문서 예시의 260초짜리 임무에는 짧다. 명령 종류별로 정하거나 규약에서 확정해야 한다.
 
